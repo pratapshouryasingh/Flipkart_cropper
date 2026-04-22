@@ -1,0 +1,8 @@
+{
+  "courier_sort": true,
+  "sku_sort": true,
+  "soldBy_sort": true,
+  "add_date_on_top": true,
+  "keep_invoice": false,
+  "sku_order_count": true
+}
