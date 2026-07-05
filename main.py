@@ -3,65 +3,56 @@ import shutil
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tempfile import TemporaryDirectory
-from pdfrw import PdfReader, PdfWriter
 from utils import (
-    
-    create_filedir,
     check_input_file,
     pdf_merger,
     convert_pdf_to_string,
     read_config,
     extract_data,
-    pdf_whitespace,
-    pdf_cropper,
+    process_pdf_optimized,
     create_count_excel,
 )
 
-def process_folder(input_path, output_path):
+def process_folder(input_path, output_path, config, timestamp):
     folder_name = os.path.basename(input_path)
-    print(f"\n=== Processing folder: {folder_name} ===")
-    
-    try:
-        # Use a temporary directory for all intermediate files
-        with TemporaryDirectory() as temp_path:
-            create_filedir(temp_path, output_path)
+    logs = []
+    logs.append(f"\n=== Processing folder: {folder_name} ===")
 
-            # Input validation
+    try:
+        with TemporaryDirectory() as temp_path:
+            os.makedirs(output_path, exist_ok=True)
+
             all_pdf = check_input_file(input_path)
             if not all_pdf:
-                print(f"⚠ No PDFs found in {input_path}")
+                logs.append(f"⚠ No PDFs found in {input_path}")
+                print("\n".join(logs))
                 return
 
-            # Read config
-            config = read_config()
-
             # Merge PDFs
-            print("Merging all the PDF Files")
+            logs.append("Merging all PDF Files")
             merged_pdf = os.path.join(temp_path, "output.pdf")
             pdf_merger(all_pdf, save_path=merged_pdf)
-            print(f"Merge Completed -> {merged_pdf}")
 
             # Convert to text
-            print("Converting PDF to Text")
+            logs.append("Converting PDF to Text")
             all_page = convert_pdf_to_string(merged_pdf)
-            print("Conversion Completed")
 
             # Extract data
-            print("Extracting Data...")
-            df = extract_data(all_page, merged_pdf, output_path)
-            print("Extraction Completed")
+            logs.append("Extracting Data...")
+            df = extract_data(all_page, merged_pdf, output_path, timestamp)
 
             # Clean & prepare sorting
-            df["sku"] = df["sku"].str.strip().fillna("")
-            df["courier"] = df["courier"].str.strip().fillna("")
-            df["soldBy"] = df["soldBy"].str.strip().fillna("")
+            for col in ("sku", "courier", "soldBy"):
+                df[col] = df[col].fillna("").str.strip()
+
             df["sku_lower"] = df["sku"].str.lower()
 
+            # Build sort lists efficiently
             sort_list = ["multi"]
             ascending_list = [True]
             if config.get("sku_sort", False):
-                sort_list.append("sku_lower")
-                ascending_list.append(False)
+                sort_list = ["qty", "sku_lower"] + sort_list
+                ascending_list = [True, True] + ascending_list
             if config.get("courier_sort", False):
                 sort_list.append("courier")
                 ascending_list.append(True)
@@ -69,45 +60,46 @@ def process_folder(input_path, output_path):
                 sort_list.append("soldBy")
                 ascending_list.append(True)
 
-            print("\nSorting by:", sort_list)
-            print("Ascending order:", ascending_list)
+            logs.append(f"Sorting by: {sort_list}")
+            logs.append(f"Ascending order: {ascending_list}")
 
-            df = df.sort_values(by=sort_list, ascending=ascending_list, na_position="last")
-            df = df.drop(columns=["sku_lower"])
-            whole_data = df.copy(deep=True)
+            # Sort with ignore_index to avoid extra work
+            df = df.sort_values(
+                by=sort_list,
+                ascending=ascending_list,
+                na_position="last",
+                ignore_index=True,
+            )
+            df.drop(columns=["sku_lower"], inplace=True)
 
-            # Create sorted PDF
-            reader_input = PdfReader(merged_pdf)
-            writer_output = PdfWriter()
-            for page in df.page.values:
-                writer_output.addpage(reader_input.pages[page])
+            # Use the same df for Excel (no copy)
+            whole_data = df
 
-            sorted_pdf_path = os.path.join(temp_path, "output_sorted.pdf")
-            writer_output.write(sorted_pdf_path)
-            print(f"Sorted PDF created -> {sorted_pdf_path}")
+            # Process PDF in sorted page order
+            page_order = df['page'].tolist()
+            logs.append("Processing PDF (cropping and date addition)...")
+            processed_pdf_path = process_pdf_optimized(
+                merged_pdf, config, temp_path, timestamp, page_order=page_order
+            )
 
-            # Process PDF (whitespace + crop)
-            whitespace_pdf_path = pdf_whitespace(sorted_pdf_path, temp_path)
-            cropped_pdf_path = pdf_cropper(whitespace_pdf_path, config, temp_path)
-
-            # Save final PDF to output folder
-            final_name = f"result_pdf_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pdf"
+            # Save final PDF (move instead of copy)
+            final_name = f"result_pdf_{timestamp}.pdf"
             final_path = os.path.join(output_path, final_name)
-            shutil.copy(cropped_pdf_path, final_path)
-            print(f"Final PDF saved as: {final_path}")
+            shutil.move(processed_pdf_path, final_path)
+            logs.append(f"Final PDF saved as: {final_path}")
 
-            # Export Excel summary report
-            print("Generating Excel summary report...")
-            summary_path = create_count_excel(whole_data, output_path)
-            print(f"Summary report saved to {summary_path}")
+            # Generate Excel summary
+            logs.append("Generating Excel summary report...")
+            summary_path = create_count_excel(whole_data, output_path, timestamp)
+            logs.append(f"Summary report saved to {summary_path}")
 
     except Exception as e:
-        print(f"Error processing {input_path}: {e}")
+        logs.append(f"Error processing {input_path}: {e}")
+
+    print("\n".join(logs))
 
 
 def main():
-
-
     input_root = "input"
     output_root = "output"
 
@@ -119,17 +111,26 @@ def main():
         print("No subfolders found in 'input'.")
         return
 
+    # Read config once
+    config = read_config()
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    # Use fewer workers to reduce disk contention
+    cpu_count = os.cpu_count() or 1
+    max_workers = min(4, len(subfolders), max(1, cpu_count // 2))
+
     futures = []
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
         for folder in subfolders:
             future = executor.submit(
                 process_folder,
                 os.path.join(input_root, folder),
                 os.path.join(output_root, folder),
+                config,
+                timestamp,
             )
             futures.append(future)
 
-        # Wait for all processes to complete
         for future in as_completed(futures):
             try:
                 future.result()
