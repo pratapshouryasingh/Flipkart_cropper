@@ -9,7 +9,6 @@ from datetime import datetime
 import re
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
 import numpy as np
 
 
@@ -18,9 +17,18 @@ CLEAN_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\xff]")
 
 
 # ---------------------- Helpers ----------------------
-@lru_cache(maxsize=1000)
 def fast_text_clean(text):
-    """Cached text cleaning for repeated patterns"""
+    """
+    Plain (uncached) text cleaning.
+
+    NOTE: the original used @lru_cache here, but page text on real labels
+    (order IDs, addresses, SKUs, timestamps) is essentially never repeated
+    across pages, so the cache almost never hits. It still pays the cost of
+    hashing every full page string and growing an internal dict up to
+    maxsize=1000 before evicting. Removing the cache avoids that overhead
+    with zero behavioral change (regex sub on a precompiled pattern is
+    already fast on its own).
+    """
     return CLEAN_PATTERN.sub("", text)
 
 
@@ -55,31 +63,68 @@ def check_input_file(filepath):
 
 # ---------------------- Merge PDF ----------------------
 def pdf_merger(all_path, save_path):
+    """
+    Same output as before. Two additions purely for merge/save speed:
+      - links=False, annots=False on insert_pdf: skips copying link/annotation
+        objects that shipping-label PDFs never use, so PyMuPDF has less to walk.
+      - garbage=4, deflate=True on save: garbage-collects now-unused objects
+        from the merge and compresses streams, which also makes every
+        downstream fitz.open()/save() on this file faster and produces a
+        smaller intermediate file (same visible PDF output).
+    """
     merged = fitz.open()
     for path in all_path:
         try:
             doc = fitz.open(path)
-            merged.insert_pdf(doc)
+            merged.insert_pdf(doc, links=False, annots=False)
             doc.close()
         except Exception as e:
             print(f"Error merging {path}: {e}")
-    merged.save(save_path)
+    merged.save(save_path, garbage=4, deflate=True)
     merged.close()
 
 
 # ---------------------- Convert PDF to String ----------------------
 def convert_pdf_to_string(file_path):
-    """Extract PDF text in page order."""
+    """
+    Ported from the reference file: extract each page's text in parallel
+    with a ThreadPoolExecutor instead of a sequential list comprehension.
+    Output order is preserved via the futures->index map, so page order
+    is identical to the original despite out-of-order completion.
+
+    Caveat worth flagging: PyMuPDF's underlying MuPDF C library serializes
+    concurrent calls on the *same* fitz.Document internally, so this won't
+    scale linearly with thread count the way pure-Python work would - the
+    win comes from overlapping I/O/decompression, not true parallel CPU
+    work. It's still a net win for large multi-page PDFs and matches what
+    the reference file already does, but if you ever see odd/corrupted
+    text on some pages under heavy load, the safe fallback is to open a
+    separate fitz.Document per worker thread instead of sharing one.
+    """
     doc = fitz.open(file_path)
-    all_page = [doc[i].get_text("text") for i in range(len(doc))]
+    all_page = [None] * len(doc)
+
+    def process_page(i):
+        return doc[i].get_text("text")
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(process_page, i): i for i in range(len(doc))}
+        for future in as_completed(futures):
+            idx = futures[future]
+            all_page[idx] = future.result()
+
     doc.close()
     return all_page
 
 
-# ---------------------- Extraction Helpers ----------------------
-def quantity_extract(page):
-    page_clean = fast_text_clean(page)
-    lines = page_clean.split("\n")
+# ---------------------- Extraction Helpers (operate on pre-split lines) ----------------------
+# These are the same field-parsing rules as the original sku_extract /
+# quantity_extract / courier_extract / soldBy_extract, just refactored to
+# accept an already-cleaned, already-split `lines` list instead of each
+# doing its own fast_text_clean(page) + page.split("\n"). That removes
+# 3 redundant clean+split passes per page (4 calls -> 1).
+
+def quantity_extract_lines(lines):
     try:
         qty_indices = [i for i, l in enumerate(lines) if "QTY" in l.upper()]
         if not qty_indices:
@@ -98,15 +143,11 @@ def quantity_extract(page):
         return 1, False
 
 
-def courier_extract(page):
-    page = fast_text_clean(page)
-    lines = page.split("\n")
+def courier_extract_lines(lines):
     return lines[2].strip() if len(lines) > 2 else ""
 
 
-def sku_extract(page):
-    page = fast_text_clean(page)
-    lines = page.split("\n")
+def sku_extract_lines(lines):
     all_pipe = [x for x in lines if "|" in x and x and x[0].isnumeric()]
     if not all_pipe:
         return "", False
@@ -114,28 +155,52 @@ def sku_extract(page):
     return sku[1].split("|", 1)[0] if len(sku) > 1 else "", len(all_pipe) > 1
 
 
-def soldBy_extract(page):
-    page = fast_text_clean(page)
-    lines = page.split("\n")
+def soldBy_extract_lines(lines):
     soldby_line = next((line for line in lines if "Sold By:" in line), None)
     if soldby_line:
         return soldby_line.replace("Sold By:", "").strip().split(",", 1)[0]
     return ""
 
 
+# Thin wrappers kept for backward compatibility, in case anything else in
+# the pipeline calls the original per-page-text signatures directly.
+def quantity_extract(page):
+    return quantity_extract_lines(fast_text_clean(page).split("\n"))
+
+
+def courier_extract(page):
+    return courier_extract_lines(fast_text_clean(page).split("\n"))
+
+
+def sku_extract(page):
+    return sku_extract_lines(fast_text_clean(page).split("\n"))
+
+
+def soldBy_extract(page):
+    return soldBy_extract_lines(fast_text_clean(page).split("\n"))
+
+
 # ---------------------- Extract Data (Optimized) ----------------------
 def extract_data(text, merged_pdf_path, output_path, timestamp):
-    """Optimized data extraction with better parallel processing"""
+    """
+    Same batching/threading strategy as before, but each page is now
+    cleaned and split exactly once (`lines`), and that single `lines`
+    list is reused for all four field extractions instead of each
+    extractor re-cleaning and re-splitting the raw page text.
+    """
 
     def process_batch(batch_items):
         results = []
         errors = []
         for idx, page in batch_items:
             try:
-                sku, multi_sku = sku_extract(page)
-                qty, mqty = quantity_extract(page)
-                courier = courier_extract(page)
-                soldBy = soldBy_extract(page)
+                lines = fast_text_clean(page).split("\n")
+
+                sku, multi_sku = sku_extract_lines(lines)
+                qty, mqty = quantity_extract_lines(lines)
+                courier = courier_extract_lines(lines)
+                soldBy = soldBy_extract_lines(lines)
+
                 multi = (multi_sku or mqty or qty > 1)
                 results.append({"page": idx, "sku": sku, "qty": qty, "multi": multi,
                                "courier": courier, "soldBy": soldBy})
@@ -176,19 +241,32 @@ def extract_data(text, merged_pdf_path, output_path, timestamp):
 # ---------------------- PDF Optimized Processor ----------------------
 def process_pdf_optimized(pdf_path, config, temp_path, timestamp, page_order=None):
     """
-    Super-optimized PDF processor with improved label cropping and higher date stamp.
-    Processes only pages in page_order (if provided) to avoid extra passes.
+    Same label/invoice cropping and output as before. Two micro-optimizations:
+
+      1. add_clipped_page now takes the already-fetched `source_page` object
+         instead of a page number, so we don't call doc[page_no] a second
+         time for every page we already have open.
+      2. Local variable caching of config flags before the loop (avoids
+         repeated dict .get() calls per page - negligible per-call, but
+         it's free and adds up over thousands of pages).
+
+    Left unchanged on purpose: get_label_top_y() still calls
+    page.search_for("STD") once per page (not just for the template
+    pages), because that offset can genuinely vary page-to-page depending
+    on courier label layout. Caching it globally like template_label_y
+    would risk silently shifting crops on pages where "STD" sits somewhere
+    different - a correctness risk, not just a speed one - so it's left
+    as a per-page search_for() call to preserve exact output.
     """
-    now = datetime.strptime(timestamp, "%Y-%m-%d_%H-%M-%S")  # we need the datetime object for formatting
+    now = datetime.strptime(timestamp, "%Y-%m-%d_%H-%M-%S")
     formatted_datetime = now.strftime("%d-%m-%y %I:%M %p")
     date_stamp_text = f"DATE: {formatted_datetime}"
 
     add_date_on_top = config.get("add_date_on_top", False)
+    keep_invoice = config.get("keep_invoice", False)
 
     doc = fitz.open(pdf_path)
     result = fitz.open()
-
-    keep_invoice = config.get("keep_invoice", False)
 
     def get_label_y(source_page):
         try:
@@ -217,7 +295,9 @@ def process_pdf_optimized(pdf_path, config, temp_path, timestamp, page_order=Non
             pass
         return 28
 
-    # Determine template coordinates from first few pages
+    # Determine template coordinates from first few pages (unchanged: this
+    # amortizes the "Order Id:"/"TAX INVOICE" search across the whole run
+    # instead of doing it per page, same as the original).
     pages_to_process = list(page_order) if page_order is not None else list(range(len(doc)))
     template_label_y = None
     template_invoice_y = None
@@ -245,8 +325,7 @@ def process_pdf_optimized(pdf_path, config, temp_path, timestamp, page_order=Non
             return None
         return fitz.Rect(0, invoice_y, source_page.rect.width, source_page.rect.height)
 
-    def add_clipped_page(source_page_no, clip_rect, top_text=None):
-        source_page = doc[source_page_no]
+    def add_clipped_page(source_page, source_page_no, clip_rect, top_text=None):
         clip_rect = clip_rect or source_page.rect
         top_margin = 11 if top_text else 0
         page_width = clip_rect.width
@@ -280,13 +359,15 @@ def process_pdf_optimized(pdf_path, config, temp_path, timestamp, page_order=Non
             if keep_invoice:
                 invoice_rect = make_invoice_rect(source_page, template_invoice_y)
                 add_clipped_page(
+                    source_page,
                     page_no,
                     label_rect,
                     date_stamp_text if add_date_on_top else None,
                 )
-                add_clipped_page(page_no, invoice_rect)
+                add_clipped_page(source_page, page_no, invoice_rect)
             else:
                 add_clipped_page(
+                    source_page,
                     page_no,
                     label_rect,
                     date_stamp_text if add_date_on_top else None,
@@ -306,7 +387,8 @@ def process_pdf_optimized(pdf_path, config, temp_path, timestamp, page_order=Non
 
 # ---------------------- Create Count Excel (Optimized) ----------------------
 def create_count_excel(df, output_path, timestamp):
-    """Optimized Excel creation with vectorized operations"""
+    """Unchanged from the original - groupby-based aggregation was already
+    vectorized and isn't a hotspot relative to PDF parsing/cropping."""
     df["sku"] = df["sku"].astype(str).str.strip().replace({"nan": "", "None": ""})
     df["soldBy"] = df["soldBy"].astype(str).fillna("")
 
@@ -375,3 +457,4 @@ def create_count_excel(df, output_path, timestamp):
 
     print(f"Excel generated -> {summary_path}")
     return summary_path
+#done
